@@ -184,6 +184,7 @@ class Emporia:
                 "emporia_name",
                 "location",
                 "parent_circuit",
+                "contains_circuits",
                 "circuit_type",
                 "label",
             ),
@@ -358,6 +359,8 @@ class Emporia:
         if circuit.is_outlet:
             circuit_type = "outlet"
 
+        contains_circuits = bool(len(circuit.child_circuits))
+
         labeled_gauge = self.gauge.labels(
             circuit=circuit.display_name,
             account=circuit.account_name,
@@ -366,8 +369,9 @@ class Emporia:
             emporia_name=circuit.name,
             location=circuit.location,
             parent_circuit=parent_circuit,
+            contains_circuits=contains_circuits,
             circuit_type=circuit_type,
-            label=circuit.label,
+            label=circuit.label or "",
         )
 
         def get_usage() -> float:
@@ -375,6 +379,34 @@ class Emporia:
             return usage[circuit.name]
 
         labeled_gauge.set_function(get_usage)
+
+        if contains_circuits:
+            # Add a gauge for the remainder (balance)
+            remainder_name = circuit.remainder_name or "{} (remainder)".format(
+                circuit.display_name
+            )
+
+            labeled_gauge = self.gauge.labels(
+                circuit=remainder_name,
+                account=circuit.account_name,
+                device_gid=None,
+                channel_num=None,
+                emporia_name=None,
+                location=circuit.location,
+                parent_circuit=circuit.name,
+                contains_circuits=False,
+                circuit_type="remainder",
+                label="",
+            )
+
+            def get_remainder() -> float:
+                usage = self.get_usage_for_circuits_with_cache()
+                usage_amount = usage[circuit.name]
+                for child in circuit.child_circuits.values():
+                    usage_amount -= usage[child.name]
+                return usage_amount
+
+            labeled_gauge.set_function(get_remainder)
 
 
 def recursive_print_circuits(circuits: Iterable[Circuit], indent: int = 2) -> None:
