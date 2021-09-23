@@ -13,67 +13,104 @@ class Config:
         with open(path, "r") as config_file:
             self.config_dict = yaml.load(config_file, Loader=yaml.Loader)
             self.locations = dict()  # type: Dict[str, "Config.ConfigLocation"]
-            self.circuit_to_parent_mapping = dict()  # type: Dict[str, str]
-            self.circuit_names = set()  # type: Set[str]
-            all_names = set()  # type: Set[str]
-
-            def _read_circuits_from_config_dict(
-                config_dict: Union[Dict[str, Any], List[str]],
-                parent_circuit_name: Optional[str] = None,
-            ) -> Dict[str, "Config.ConfigCircuit"]:
-                circuits = dict()  # type:  Dict[str, "Config.ConfigCircuit"]
-
-                if isinstance(config_dict, list):
-                    for circuit_name in config_dict:
-                        circuits[circuit_name] = Config.ConfigCircuit(
-                            name=circuit_name,
-                            child_circuits=dict(),
-                        )
-                        if parent_circuit_name:
-                            self.circuit_to_parent_mapping[
-                                circuit_name
-                            ] = parent_circuit_name
-
-                elif isinstance(config_dict, dict):
-                    for circuit_name, circuit_dict in config_dict.items():
-                        if circuit_name in all_names:
-                            raise Exception(
-                                "Found circuit named {} defined multiple times in config - this is not allowed".format(
-                                    circuit_name
-                                )
-                            )
-                        self.circuit_names.add(circuit_name)
-                        all_names.add(circuit_name)
-
-                        if parent_circuit_name:
-                            self.circuit_to_parent_mapping[
-                                circuit_name
-                            ] = parent_circuit_name
-
-                        circuits[circuit_name] = Config.ConfigCircuit(
-                            name=circuit_name,
-                            child_circuits=_read_circuits_from_config_dict(
-                                parent_circuit_name=circuit_name,
-                                config_dict=circuit_dict,
-                            ),
-                        )
-
-                return circuits
+            self.all_names = set()  # type: Set[str]
 
             if "locations" in self.config_dict:
-                for location_name, circuits in self.config_dict["locations"].items():
-                    if location_name in all_names:
+                for location_name, location_dict in self.config_dict[
+                    "locations"
+                ].items():
+                    if location_name in self.all_names:
                         raise Exception(
                             "Found location named {} defined multiple times in config - this is not allowed".format(
                                 location_name
                             )
                         )
-                    all_names.add(location_name)
+                    self.all_names.add(location_name)
 
-                    circuits_dict = _read_circuits_from_config_dict(circuits)
+                    circuits_dict = dict()
+                    if "circuits" in location_dict:
+                        circuits_dict.update(
+                            self._read_circuits_from_config_dict(
+                                location_dict["circuits"], are_outlets=False
+                            )
+                        )
+                    if "outlets" in location_dict:
+                        circuits_dict.update(
+                            self._read_circuits_from_config_dict(
+                                location_dict["outlets"], are_outlets=True
+                            )
+                        )
+
                     self.locations[location_name] = Config.ConfigLocation(
                         name=location_name, circuits=circuits_dict
                     )
+
+    def _read_circuits_from_config_dict(
+        self,
+        config_dict: Union[Dict[str, Any], List[str]],
+        are_outlets: bool,
+    ) -> Dict[str, "Config.ConfigCircuit"]:
+        circuits = dict()  # type:  Dict[str, "Config.ConfigCircuit"]
+
+        if isinstance(config_dict, list):
+            for circuit_name in config_dict:
+                circuits[circuit_name] = Config.ConfigCircuit(
+                    name=circuit_name,
+                    display_name=circuit_name,
+                    label=None,
+                    is_outlet=are_outlets,
+                    remainder_name=None,
+                    child_circuits=dict(),
+                )
+
+        elif isinstance(config_dict, dict):
+            for circuit_name, circuit_dict in config_dict.items():
+                if circuit_name in self.all_names:
+                    raise Exception(
+                        "Found circuit named {} defined multiple times in config - this is not allowed".format(
+                            circuit_name
+                        )
+                    )
+                self.all_names.add(circuit_name)
+
+                child_circuits = dict()
+                if "circuits" in circuit_dict:
+                    child_circuits.update(
+                        self._read_circuits_from_config_dict(
+                            config_dict=circuit_dict["circuits"],
+                            are_outlets=False,
+                        )
+                    )
+                if "outlets" in circuit_dict:
+                    child_circuits.update(
+                        self._read_circuits_from_config_dict(
+                            config_dict=circuit_dict["outlets"],
+                            are_outlets=True,
+                        )
+                    )
+
+                display_name = circuit_name
+                if "display_name" in circuit_dict:
+                    display_name = circuit_dict["display_name"]
+
+                label = None
+                if "label" in circuit_dict:
+                    label = circuit_dict["label"]
+
+                remainder_name = None
+                if "remainder" in circuit_dict:
+                    remainder_name = circuit_dict["remainder"]
+
+                circuits[circuit_name] = Config.ConfigCircuit(
+                    name=circuit_name,
+                    display_name=display_name,
+                    label=label,
+                    is_outlet=are_outlets,
+                    remainder_name=remainder_name,
+                    child_circuits=child_circuits,
+                )
+
+        return circuits
 
     @property
     def accounts(self) -> Any:
@@ -87,6 +124,10 @@ class Config:
     @attr.s
     class ConfigCircuit:
         name = attr.ib(type=str)
+        display_name = attr.ib(type=str)
+        label = attr.ib(type=Optional[str])
+        is_outlet = attr.ib(type=bool)
+        remainder_name = attr.ib(type=Optional[str])
         child_circuits = attr.ib(type=Dict[str, "Config.ConfigCircuit"])
 
 
@@ -104,6 +145,9 @@ class Circuit:
     channel_num = attr.ib(type=str)
     is_outlet = attr.ib(type=bool)
     child_circuits = attr.ib(type=Dict[str, "Circuit"])
+    display_name = attr.ib(type=Optional[str], default=None)
+    label = attr.ib(type=Optional[str], default=None)
+    remainder_name = attr.ib(type=Optional[str], default=None)
 
 
 class Emporia:
@@ -122,103 +166,109 @@ class Emporia:
             for name in self.config.locations.keys()
         }
 
+        circuits_to_add = dict()  # type: Dict[str, Circuit]
         for account_name, account_details in self.config.accounts.items():
             self.accounts[account_name] = account = PyEmVue()
             account.login(
                 username=account_details["email"], password=account_details["password"]
             )
 
-            found_circuit_names = set()  # type: Set[str]
-            devices = account.get_devices()
-            for device in devices:
+            for device in account.get_devices():
                 if len(device.channels) == 1:
-                    found_circuit_names.add(device.device_name)
-                    assert self._add_circuit(
-                        Circuit(
-                            name=device.device_name,
-                            account_name=account_name,
-                            device_gid=device.device_gid,
-                            channel_num=device.channels[0].channel_num,
-                            is_outlet=bool(device.outlet),
-                            child_circuits=dict(),
-                        ),
-                        default_location=account_name,
-                    ), (
-                        "Failed to add " + device.device_name
+                    circuits_to_add[device.device_name] = Circuit(
+                        name=device.device_name,
+                        account_name=account_name,
+                        device_gid=device.device_gid,
+                        channel_num=device.channels[0].channel_num,
+                        is_outlet=bool(device.outlet),
+                        child_circuits=dict(),
                     )
                 else:
                     for channel in device.channels:
-                        found_circuit_names.add(channel.name)
-                        assert self._add_circuit(
-                            Circuit(
-                                name=channel.name,
-                                account_name=account_name,
-                                device_gid=device.device_gid,
-                                channel_num=channel.channel_num,
-                                is_outlet=False,
-                                child_circuits=dict(),
-                            ),
-                            default_location=account_name,
-                        ), (
-                            "Failed to add " + device.device_name
+                        circuits_to_add[channel.name] = Circuit(
+                            name=channel.name,
+                            account_name=account_name,
+                            device_gid=device.device_gid,
+                            channel_num=channel.channel_num,
+                            is_outlet=False,
+                            child_circuits=dict(),
                         )
 
-            missing_circuits = self.config.circuit_names - found_circuit_names
-            if missing_circuits:
-                print("WARNING: Some circuits that were configured were not found.")
-                print("These are: " + ",".join(missing_circuits))
+        for config_location in self.config.locations.values():
+            self._populate_circuits_recursive(
+                config_circuits=config_location.circuits.values(),
+                circuit_container=self.locations[config_location.name].circuits,
+                circuits_to_add=circuits_to_add,
+            )
 
-    def _add_circuit(self, circuit: Circuit, default_location: str) -> None:
-        assert self.locations, "Programming error: missing locations"
-
-        if circuit.name not in self.config.circuit_to_parent_mapping:
+        # Put remaining (unconfigured) circuits in default locations
+        for circuit in circuits_to_add.values():
             location = self.config.accounts[circuit.account_name].get(
-                "location", default_location
+                "location", circuit.account_name
             )
             if location not in self.locations:
                 self.locations[location] = Location(name=location, circuits=dict())
 
             self.locations[location].circuits[circuit.name] = circuit
-        else:
-            parent_circuit_name = self.config.circuit_to_parent_mapping[circuit.name]
-            if parent_circuit_name in self.locations:
-                self.locations[parent_circuit_name].circuits[circuit.name] = circuit
-            else:
-                # This is a stupid way to do this, but it probably doesn't matter
-                def _add_circuit_recursive(
-                    circuit: Circuit, container: Circuit, parent_circuit_name: str
-                ) -> bool:
-                    if container.name == parent_circuit_name:
-                        container.child_circuits[circuit.name] = circuit
-                        return True
-                    else:
-                        for idx_circuit in location.child_circuits.values():
-                            if _add_circuit_recursive(
-                                circuit, idx_circuit, parent_circuit_name
-                            ):
-                                return True
-                        return False
 
-                done = False
-                for location in self.locations.values():
-                    for idx_circuit in location.circuits.values():
-                        if _add_circuit_recursive(
-                            circuit, idx_circuit, parent_circuit_name
-                        ):
-                            if done:
-                                raise Exception(
-                                    "Attempted to duplicate circuit {} times".format(
-                                        circuit.name
-                                    )
-                                )
-                            done = True
+    def _populate_circuits_recursive(
+        self,
+        config_circuits: Iterable[Config.ConfigCircuit],
+        circuit_container: Dict[str, Circuit],
+        circuits_to_add: Dict[str, Circuit],
+    ) -> None:
+        for config_circuit in config_circuits:
+            if config_circuit.name in circuits_to_add:
+                circuit_container[config_circuit.name] = this_circuit = circuits_to_add[
+                    config_circuit.name
+                ]
+                this_circuit.display_name = (
+                    config_circuit.display_name or config_circuit.name
+                )
+                this_circuit.label = config_circuit.label
+                this_circuit.remainder_name = config_circuit.remainder_name
+
+                if config_circuit.is_outlet != this_circuit.is_outlet:
+                    print(
+                        "WARNING: Circuit {} {} configured as an outlet, but actually {} an outlet.".format(
+                            config_circuit.name,
+                            "is" if config_circuit.is_outlet else "is not",
+                            "is" if this_circuit.is_outlet else "is not",
+                        )
+                    )
+
+                del circuits_to_add[config_circuit.name]
+                self._populate_circuits_recursive(
+                    config_circuits=config_circuit.child_circuits.values(),
+                    circuit_container=this_circuit.child_circuits,
+                    circuits_to_add=circuits_to_add,
+                )
+            else:
+                print(
+                    "WARNING: Configured circuit {} not found in actual devices and channels".format(
+                        config_circuit.name
+                    )
+                )
 
 
 def recursive_print_circuits(circuits: Iterable[Circuit], indent: int = 2) -> None:
     for circuit in circuits:
         outlet_suffix = "(outlet)" if circuit.is_outlet else ""
-        print("{}- {} {}".format(" " * indent, circuit.name, outlet_suffix))
+        label_suffix = "[{}]".format(circuit.label) if circuit.label else ""
+        print(
+            "{}- {} {}{}".format(
+                " " * indent, circuit.display_name, label_suffix, outlet_suffix
+            )
+        )
+
         recursive_print_circuits(circuit.child_circuits.values(), indent=indent + 2)
+        if circuit.remainder_name:
+            print(
+                "{}- {} (remainder)".format(
+                    " " * (indent + 2),
+                    circuit.remainder_name,
+                )
+            )
 
 
 if __name__ == "__main__":
