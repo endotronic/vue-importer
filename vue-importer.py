@@ -1,12 +1,14 @@
 import argparse
 from datetime import datetime, timedelta
-from threading import Lock
+import signal
+from threading import Event, Lock
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import attr
-import yaml
+from prometheus_client import start_http_server, Gauge  # type: ignore
 from pyemvue import PyEmVue  # type: ignore
 from pyemvue.enums import Scale, Unit  # type: ignore
+import yaml
 
 
 class Config:
@@ -146,6 +148,8 @@ class Circuit:
     channel_num = attr.ib(type=str)
     is_outlet = attr.ib(type=bool)
     child_circuits = attr.ib(type=Dict[str, "Circuit"])
+    location = attr.ib(type=Optional[str], default=None)
+    parent_circuit = attr.ib(type=Optional["Circuit"], default=None)
     display_name = attr.ib(type=Optional[str], default=None)
     label = attr.ib(type=Optional[str], default=None)
     remainder_name = attr.ib(type=Optional[str], default=None)
@@ -153,7 +157,7 @@ class Circuit:
 
 @attr.s
 class CachedUsage:
-    circuit_usage = attr.ib(type=Dict[Circuit, float])
+    circuit_usage = attr.ib(type=Dict[str, float])
     fetch_time = attr.ib(type=datetime)
 
 
@@ -162,10 +166,28 @@ class Emporia:
         self.config = config
         self.accounts = None  # type: Optional[Dict[str, PyEmVue]]
         self.locations = None  # type: Optional[Dict[str, Location]]
+
         self.circuits_by_name = dict()  # type: Dict[str, Circuit]
         self.circuits_by_device = dict()  # type: Dict[Tuple[str, str], Circuit]
+
         self.cached_usage = None  # type: Optional[CachedUsage]
         self.cache_lock = Lock()
+
+        self.gauge = Gauge(
+            "emporia_usage",
+            "Usage of circuit in watts",
+            (
+                "circuit",
+                "account",
+                "device_gid",
+                "channel_num",
+                "emporia_name",
+                "location",
+                "parent_circuit",
+                "circuit_type",
+                "label",
+            ),
+        )
 
     def do_logins_and_build_circuits(self) -> None:
         if self.accounts:
@@ -221,6 +243,7 @@ class Emporia:
                 config_circuits=config_location.circuits.values(),
                 circuit_container=self.locations[config_location.name].circuits,
                 circuits_to_add=circuits_to_add,
+                location=config_location.name,
             )
 
         # Put remaining (unconfigured) circuits in default locations
@@ -232,12 +255,15 @@ class Emporia:
                 self.locations[location] = Location(name=location, circuits=dict())
 
             self.locations[location].circuits[circuit.name] = circuit
+            circuit.location = location
 
     def _populate_circuits_recursive(
         self,
         config_circuits: Iterable[Config.ConfigCircuit],
         circuit_container: Dict[str, Circuit],
         circuits_to_add: Dict[str, Circuit],
+        location: str,
+        parent_circuit: Optional[Circuit] = None,
     ) -> None:
         for config_circuit in config_circuits:
             if config_circuit.name in circuits_to_add:
@@ -249,6 +275,8 @@ class Emporia:
                 )
                 this_circuit.label = config_circuit.label
                 this_circuit.remainder_name = config_circuit.remainder_name
+                this_circuit.location = location
+                this_circuit.parent_circuit = parent_circuit
 
                 if config_circuit.is_outlet != this_circuit.is_outlet:
                     print(
@@ -264,6 +292,8 @@ class Emporia:
                     config_circuits=config_circuit.child_circuits.values(),
                     circuit_container=this_circuit.child_circuits,
                     circuits_to_add=circuits_to_add,
+                    location=location,
+                    parent_circuit=this_circuit,
                 )
             else:
                 print(
@@ -272,9 +302,9 @@ class Emporia:
                     )
                 )
 
-    def get_usage_for_circuits(self) -> Dict[Circuit, float]:
+    def get_usage_for_circuits(self) -> Dict[str, float]:
         assert self.accounts, "Programming error, must log in first"
-        circuit_usage = dict()  # type: Dict[Circuit, float]
+        circuit_usage = dict()  # type: Dict[str, float]
 
         for account_name, account in self.accounts.items():
             query_time = datetime.utcnow() - timedelta(seconds=5)
@@ -284,6 +314,7 @@ class Emporia:
                 if circuit.account_name == account_name
             ]
 
+            print('Querying usage for account "{}"'.format(account_name))
             device_usage_dict = account.get_device_list_usage(
                 deviceGids=device_gids,
                 instant=query_time,
@@ -297,11 +328,11 @@ class Emporia:
                         (device_gid, channel.channel_num)
                     )
                     if circuit:  # there may be extra information, e.g. "Balance"
-                        circuit_usage[circuit] = channel.usage * 3600 * 1000
+                        circuit_usage[circuit.name] = channel.usage * 3600 * 1000
 
         return circuit_usage
 
-    def get_usage_for_circuits_with_cache(self) -> Dict[Circuit, float]:
+    def get_usage_for_circuits_with_cache(self) -> Dict[str, float]:
         with self.cache_lock:
             now = datetime.utcnow()
             cache_ttl = timedelta(seconds=15)
@@ -313,6 +344,37 @@ class Emporia:
                 circuit_usage=circuit_usage, fetch_time=datetime.utcnow()
             )
             return circuit_usage
+
+    def build_gauges(self) -> None:
+        for circuit in self.circuits_by_name.values():
+            self._build_gauge(circuit)
+
+    def _build_gauge(self, circuit: Circuit) -> None:
+        parent_circuit = None
+        if circuit.parent_circuit:
+            parent_circuit = circuit.parent_circuit.display_name
+
+        circuit_type = "circuit"
+        if circuit.is_outlet:
+            circuit_type = "outlet"
+
+        labeled_gauge = self.gauge.labels(
+            circuit=circuit.display_name,
+            account=circuit.account_name,
+            device_gid=circuit.device_gid,
+            channel_num=circuit.channel_num,
+            emporia_name=circuit.name,
+            location=circuit.location,
+            parent_circuit=parent_circuit,
+            circuit_type=circuit_type,
+            label=circuit.label,
+        )
+
+        def get_usage() -> float:
+            usage = self.get_usage_for_circuits_with_cache()
+            return usage[circuit.name]
+
+        labeled_gauge.set_function(get_usage)
 
 
 def recursive_print_circuits(circuits: Iterable[Circuit], indent: int = 2) -> None:
@@ -358,6 +420,8 @@ if __name__ == "__main__":
 
     config = Config(args.config)
     emporia = Emporia(config)
+
+    print("Logging in to Emporia...")
     emporia.do_logins_and_build_circuits()
 
     if args.list_devices:
@@ -367,4 +431,11 @@ if __name__ == "__main__":
             print("Circuits:")
             recursive_print_circuits(location.circuits.values())
     else:
-        emporia.get_usage_for_circuits()
+        exit_event = Event()
+        signal.signal(signal.SIGINT, lambda _s, _f: exit_event.set())
+        signal.signal(signal.SIGHUP, lambda _s, _f: exit_event.set())
+
+        emporia.build_gauges()
+        start_http_server(8000)
+        print("Server is running.")
+        exit_event.wait()
