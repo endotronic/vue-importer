@@ -1,5 +1,6 @@
 import argparse
 from datetime import datetime, timedelta
+from threading import Lock
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import attr
@@ -150,11 +151,21 @@ class Circuit:
     remainder_name = attr.ib(type=Optional[str], default=None)
 
 
+@attr.s
+class CachedUsage:
+    circuit_usage = attr.ib(type=Dict[Circuit, float])
+    fetch_time = attr.ib(type=datetime)
+
+
 class Emporia:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.accounts = None  # type: Optional[Dict[str, PyEmVue]]
         self.locations = None  # type: Optional[Dict[str, Location]]
+        self.circuits_by_name = dict()  # type: Dict[str, Circuit]
+        self.circuits_by_device = dict()  # type: Dict[Tuple[str, str], Circuit]
+        self.cached_usage = None  # type: Optional[CachedUsage]
+        self.cache_lock = Lock()
 
     def do_logins_and_build_circuits(self) -> None:
         if self.accounts:
@@ -193,6 +204,17 @@ class Emporia:
                             is_outlet=False,
                             child_circuits=dict(),
                         )
+
+        # Before populating circuits, which will remove them from this
+        # convenient dict, build lookup tables so they can be accessed
+        # by device_gid and channel_num or by name
+        self.circuits_by_name = {
+            circuit.name: circuit for circuit in circuits_to_add.values()
+        }
+        self.circuits_by_device = {
+            (circuit.device_gid, circuit.channel_num): circuit
+            for circuit in circuits_to_add.values()
+        }
 
         for config_location in self.config.locations.values():
             self._populate_circuits_recursive(
@@ -250,6 +272,48 @@ class Emporia:
                     )
                 )
 
+    def get_usage_for_circuits(self) -> Dict[Circuit, float]:
+        assert self.accounts, "Programming error, must log in first"
+        circuit_usage = dict()  # type: Dict[Circuit, float]
+
+        for account_name, account in self.accounts.items():
+            query_time = datetime.utcnow() - timedelta(seconds=5)
+            device_gids = [
+                circuit.device_gid
+                for circuit in self.circuits_by_name.values()
+                if circuit.account_name == account_name
+            ]
+
+            device_usage_dict = account.get_device_list_usage(
+                deviceGids=device_gids,
+                instant=query_time,
+                scale=Scale.SECOND.value,
+                unit=Unit.KWH.value,
+            )
+
+            for device_gid, device_usage in device_usage_dict.items():
+                for channel in device_usage.channels.values():
+                    circuit = self.circuits_by_device.get(
+                        (device_gid, channel.channel_num)
+                    )
+                    if circuit:  # there may be extra information, e.g. "Balance"
+                        circuit_usage[circuit] = channel.usage * 3600 * 1000
+
+        return circuit_usage
+
+    def get_usage_for_circuits_with_cache(self) -> Dict[Circuit, float]:
+        with self.cache_lock:
+            now = datetime.utcnow()
+            cache_ttl = timedelta(seconds=15)
+            if self.cached_usage and now - self.cached_usage.fetch_time < cache_ttl:
+                return self.cached_usage.circuit_usage
+
+            circuit_usage = self.get_usage_for_circuits()
+            self.cached_usage = CachedUsage(
+                circuit_usage=circuit_usage, fetch_time=datetime.utcnow()
+            )
+            return circuit_usage
+
 
 def recursive_print_circuits(circuits: Iterable[Circuit], indent: int = 2) -> None:
     for circuit in circuits:
@@ -294,13 +358,13 @@ if __name__ == "__main__":
 
     config = Config(args.config)
     emporia = Emporia(config)
+    emporia.do_logins_and_build_circuits()
 
     if args.list_devices:
-        emporia.do_logins_and_build_circuits()
         assert emporia.locations, "Failed to build locations"
         for location in emporia.locations.values():
             print("Location: " + location.name)
             print("Circuits:")
             recursive_print_circuits(location.circuits.values())
     else:
-        print("not implemented")
+        emporia.get_usage_for_circuits()
