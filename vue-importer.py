@@ -328,8 +328,14 @@ class Emporia:
                     circuit = self.circuits_by_device.get(
                         (device_gid, channel.channel_num)
                     )
-                    if circuit:  # there may be extra information, e.g. "Balance"
-                        circuit_usage[circuit.name] = channel.usage * 3600 * 1000
+                    # Note that there may be extra information, e.g. "Balance"
+                    # in the result, and channel.usage may be None, e.g. if
+                    # a smart outlet is off.
+                    if circuit:
+                        if channel.usage:
+                            circuit_usage[circuit.name] = channel.usage * 3600 * 1000
+                        else:
+                            circuit_usage[circuit.name] = 0
 
         return circuit_usage
 
