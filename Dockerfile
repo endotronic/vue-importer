@@ -40,4 +40,4 @@ WORKDIR /opt/vue_importer
 COPY *.py .
 
 # Run the application
-ENTRYPOINT ["python", "vue-importer.py"]
+ENTRYPOINT ["python", "-u", "vue-importer.py"]

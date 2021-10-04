@@ -382,6 +382,10 @@ class Emporia:
 
         def get_usage() -> float:
             usage = self.get_usage_for_circuits_with_cache()
+
+            # Raise an exception if we have no usage and let
+            # Prometheus handle the exception to return no value
+            assert circuit.name in usage, "No usage for " + circuit.name
             return usage[circuit.name]
 
         labeled_gauge.set_function(get_usage)
