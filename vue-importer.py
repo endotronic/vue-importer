@@ -207,7 +207,15 @@ class Emporia:
                 username=account_details["email"], password=account_details["password"]
             )
 
-            for device in account.get_devices():
+            devices = account.get_devices()
+            if not devices:
+                raise Exception(
+                    "Account {} has no devices. Assuming bad configuration and terminating.".format(
+                        account_name
+                    )
+                )
+
+            for device in devices:
                 if len(device.channels) == 1:
                     circuits_to_add[device.device_name] = Circuit(
                         name=device.device_name,
@@ -336,6 +344,15 @@ class Emporia:
                             circuit_usage[circuit.name] = channel.usage * 3600 * 1000
                         else:
                             circuit_usage[circuit.name] = 0
+
+            for circuit_name in self.circuits_by_name.keys():
+                if circuit_name not in circuit_usage:
+                    print(
+                        "WARNING: Missing usage data for circuit {}".format(
+                            circuit_name
+                        )
+                    )
+                    circuit_usage[circuit_name] = 0
 
         return circuit_usage
 
